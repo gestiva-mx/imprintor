@@ -6,14 +6,16 @@ use std::sync::{Arc, Mutex};
 use typst::diag::{FileError, FileResult, PackageError, PackageResult};
 use typst::ecow::eco_format;
 use typst::foundations::{Array, Dict, Str, Value};
-use typst::foundations::{Bytes, Datetime};
+use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::package::PackageSpec;
-use typst::syntax::{FileId, Source};
+use typst::syntax::{FileId, Source, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt};
-use typst_kit::fonts::{FontSlot, Fonts};
+use typst_kit::fonts::{self, FontStore};
+use typst_layout::PagedDocument;
 use typst_pdf::{PdfOptions, PdfStandard, PdfStandards};
+use typst_render::RenderOptions;
 /// A File that will be stored in the HashMap.
 #[derive(Clone, Debug)]
 struct FileEntry {
@@ -47,13 +49,11 @@ impl FileEntry {
     }
 }
 
-#[derive(Debug)]
 struct ImprintorNifWorld {
     root: PathBuf,
     source: Source,
     library: LazyHash<Library>,
-    book: LazyHash<FontBook>,
-    fonts: Vec<FontSlot>,
+    fonts: FontStore,
     files: Arc<Mutex<HashMap<FileId, FileEntry>>>,
     time: time::OffsetDateTime,
     cache_directory: PathBuf,
@@ -66,18 +66,21 @@ pub struct ImprintorConfig<'a> {
     data: Option<Term<'a>>,
     root_directory: String,
     pdf_standard: Option<String>,
+    ppi: Option<f64>,
 }
 
 impl ImprintorNifWorld {
     fn new(config: ImprintorConfig) -> Self {
         let root = PathBuf::from(config.root_directory);
 
-        let font_searcher = match config.extra_fonts {
-            Some(fonts) => Fonts::searcher()
-                .include_system_fonts(true)
-                .search_with(fonts),
-            None => Fonts::searcher().include_system_fonts(true).search(),
-        };
+        let mut font_store = FontStore::new();
+        font_store.extend(fonts::system());
+        font_store.extend(fonts::embedded());
+        if let Some(extra_fonts) = config.extra_fonts {
+            for path in &extra_fonts {
+                font_store.extend(fonts::scan(std::path::Path::new(path)));
+            }
+        }
 
         let mut dict = Dict::new();
 
@@ -95,9 +98,8 @@ impl ImprintorNifWorld {
 
         Self {
             source: Source::detached(config.source_document),
-            fonts: font_searcher.fonts,
+            fonts: font_store,
             time: time::OffsetDateTime::now_utc(),
-            book: LazyHash::new(font_searcher.book),
             library: LazyHash::new(library),
             files: Arc::new(Mutex::new(HashMap::new())),
             root,
@@ -113,15 +115,18 @@ impl ImprintorNifWorld {
         if let Some(entry) = files.get(&id) {
             return Ok(entry.clone());
         }
-        let path = if let Some(package) = id.package() {
-            // Fetching file from package
-            let package_dir = self.download_package(package)?;
-            id.vpath().resolve(&package_dir)
-        } else {
-            // Fetching file from disk
-            id.vpath().resolve(&self.root)
+        let path = match id.root() {
+            VirtualRoot::Package(package) => {
+                // Fetching file from package
+                let package_dir = self.download_package(package)?;
+                id.vpath().realize(&package_dir)
+            }
+            VirtualRoot::Project => {
+                // Fetching file from disk
+                id.vpath().realize(&self.root)
+            }
         }
-        .ok_or(FileError::AccessDenied)?;
+        .map_err(|_| FileError::AccessDenied)?;
 
         let content = std::fs::read(&path).map_err(|error| FileError::from_io(error, &path))?;
         Ok(files
@@ -262,7 +267,7 @@ impl typst::World for ImprintorNifWorld {
 
     /// Metadata about all known Books.
     fn book(&self) -> &LazyHash<FontBook> {
-        &self.book
+        self.fonts.book()
     }
 
     /// Accessing the main source file.
@@ -286,17 +291,33 @@ impl typst::World for ImprintorNifWorld {
 
     /// Accessing a specified font per index of font book.
     fn font(&self, id: usize) -> Option<Font> {
-        self.fonts[id].get()
+        self.fonts.font(id)
     }
 
     /// Get the current date.
     ///
     /// Optionally, an offset in hours is given.
-    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
-        let offset = offset.unwrap_or(0);
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+        let offset = offset.map(|offset| offset.hours() as i64).unwrap_or(0);
         let offset = time::UtcOffset::from_hms(offset.try_into().ok()?, 0, 0).ok()?;
         let time = self.time.checked_to_offset(offset)?;
         Some(Datetime::Date(time.date()))
+    }
+}
+
+/// Compiles the world's source into a paged document, formatting any
+/// diagnostics into a single error string on failure.
+fn compile_document(world: &ImprintorNifWorld) -> Result<PagedDocument, String> {
+    match typst::compile::<PagedDocument>(world).output {
+        Ok(document) => Ok(document),
+        Err(errors) => {
+            let error_msg = errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!("Compilation failed: {}", error_msg))
+        }
     }
 }
 
@@ -307,50 +328,130 @@ fn typst_to_pdf<'a>(
 ) -> Result<rustler::Binary<'a>, String> {
     let pdf_options = build_pdf_options(config.pdf_standard.as_deref())?;
     let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
 
-    match typst::compile(&world).output {
-        Ok(document) => {
-            let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
-            let mut binary = rustler::OwnedBinary::new(pdf_bytes.len()).unwrap();
-            binary.as_mut_slice().copy_from_slice(&pdf_bytes);
-            Ok(binary.release(env))
-        }
-        Err(errors) => {
-            let error_msg = errors
-                .iter()
-                .map(|e| format!("{:?}", e))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(format!("Compilation failed: {}", error_msg))
-        }
-    }
+    let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
+    let mut binary = rustler::OwnedBinary::new(pdf_bytes.len()).unwrap();
+    binary.as_mut_slice().copy_from_slice(&pdf_bytes);
+    Ok(binary.release(env))
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
 fn typst_to_pdf_file<'a>(config: ImprintorConfig, output_path: String) -> Result<String, String> {
     let pdf_options = build_pdf_options(config.pdf_standard.as_deref())?;
     let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
 
-    match typst::compile(&world).output {
-        Ok(document) => {
-            let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
-            match std::fs::write(&output_path, pdf_bytes) {
-                Ok(_) => Ok(output_path.into()),
-                Err(err) => Err(err.to_string().into()),
+    let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
+    std::fs::write(&output_path, pdf_bytes).map_err(|err| err.to_string())?;
+    Ok(output_path)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn typst_to_png<'a>(
+    env: rustler::Env<'a>,
+    config: ImprintorConfig,
+) -> Result<Vec<rustler::Binary<'a>>, String> {
+    let ppi = config.ppi;
+    let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
+    let pages = render_document_to_pngs(&document, ppi)?;
+
+    pages
+        .into_iter()
+        .map(|png_bytes| {
+            let mut binary = rustler::OwnedBinary::new(png_bytes.len()).unwrap();
+            binary.as_mut_slice().copy_from_slice(&png_bytes);
+            Ok(binary.release(env))
+        })
+        .collect()
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn typst_to_png_file(config: ImprintorConfig, output_path: String) -> Result<Vec<String>, String> {
+    let ppi = config.ppi;
+    let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
+    let pages = render_document_to_pngs(&document, ppi)?;
+
+    let output_paths = page_output_paths(&output_path, pages.len());
+
+    for (index, (path, png_bytes)) in output_paths.iter().zip(pages).enumerate() {
+        if let Err(err) = std::fs::write(path, png_bytes) {
+            for written_path in &output_paths[..index] {
+                let _ = std::fs::remove_file(written_path);
             }
+            return Err(err.to_string());
         }
-        Err(errors) => {
-            let error_msg = errors
-                .iter()
-                .map(|e| format!("{:?}", e))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(format!("Compilation failed: {}", error_msg))
-        }
+    }
+
+    Ok(output_paths)
+}
+
+/// Renders every page of a document to PNG bytes at the given pixel density.
+///
+/// `ppi` defaults to 144 (matching `typst-cli`'s default) when not given.
+fn render_document_to_pngs(
+    document: &PagedDocument,
+    ppi: Option<f64>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let options = build_render_options(ppi);
+
+    document
+        .pages()
+        .iter()
+        .map(|page| {
+            typst_render::render(page, &options)
+                .encode_png()
+                .map_err(|err| format!("Failed to encode PNG: {err}"))
+        })
+        .collect()
+}
+
+fn build_render_options(ppi: Option<f64>) -> RenderOptions {
+    let ppi = ppi.unwrap_or(144.0);
+
+    RenderOptions {
+        pixel_per_pt: typst::utils::Scalar::new(ppi / 72.0),
+        render_bleed: false,
     }
 }
 
-fn build_pdf_options(pdf_standard: Option<&str>) -> Result<PdfOptions<'static>, String> {
+/// Derives one output path per page. A single-page document is written
+/// directly to `output_path`; multi-page documents get the 1-based page
+/// number inserted before the file extension (e.g. `out.png` -> `out-1.png`,
+/// `out-2.png`, ...).
+fn page_output_paths(output_path: &str, page_count: usize) -> Vec<String> {
+    if page_count <= 1 {
+        return vec![output_path.to_string()];
+    }
+
+    let path = std::path::Path::new(output_path);
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(output_path);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+
+    (1..=page_count)
+        .map(|page_number| {
+            let file_name = match extension {
+                Some(extension) => format!("{stem}-{page_number}.{extension}"),
+                None => format!("{stem}-{page_number}"),
+            };
+
+            match parent {
+                Some(parent) => parent.join(file_name).to_string_lossy().into_owned(),
+                None => file_name,
+            }
+        })
+        .collect()
+}
+
+fn build_pdf_options(pdf_standard: Option<&str>) -> Result<PdfOptions, String> {
     let mut options = PdfOptions::default();
 
     if let Some(standard_value) = pdf_standard {
@@ -362,8 +463,8 @@ fn build_pdf_options(pdf_standard: Option<&str>) -> Result<PdfOptions<'static>, 
             )
         })?;
 
-        options.standards =
-            PdfStandards::new(&[standard]).map_err(|err| format!("Invalid PDF standard: {err}"))?;
+        options.standards = PdfStandards::new(&[standard])
+            .map_err(|err| format!("Invalid PDF standard: {err:?}"))?;
     }
 
     Ok(options)
@@ -394,6 +495,25 @@ fn parse_pdf_standard(input: &str) -> Option<PdfStandard> {
         "a-4f" => Some(PdfStandard::A_4f),
         "ua-1" => Some(PdfStandard::Ua_1),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `build_pdf_options` only ever calls `PdfStandards::new` with a single
+    /// standard, so it can never hit the conflicting-standards error branch.
+    /// This exercises that branch directly against the underlying crate to
+    /// confirm `PdfStandards::new`'s error type is still `Debug`-formattable
+    /// (the `{err:?}` in `build_pdf_options` relies on this after typst-pdf
+    /// 0.15 dropped `Display` from `HintedString`).
+    #[test]
+    fn conflicting_pdf_standards_error_is_debug_formattable() {
+        let result = PdfStandards::new(&[PdfStandard::V_1_4, PdfStandard::V_1_7]);
+        let err = result.expect_err("conflicting PDF version standards should fail to construct");
+        let message = format!("Invalid PDF standard: {err:?}");
+        assert!(!message.is_empty());
     }
 }
 

@@ -1,12 +1,13 @@
 # Imprintor
 
-A fast and efficient Elixir library for generating PDF documents from [Typst](https://typst.app/) templates using native Rust implementations.
+A fast and efficient Elixir library for generating PDF and PNG documents from [Typst](https://typst.app/) templates using native Rust implementations.
 
 ## Features
 
-- 🚀 **Fast PDF generation** using native Rust and Typst
+- 🚀 **Fast PDF and PNG generation** using native Rust and Typst
 - 📄 **Template-based** document creation with data integration
-- 💾 **In-memory PDF generation** - returns PDF binary data
+- 💾 **In-memory generation** - returns PDF/PNG binary data
+- 🖼️ **PNG rendering** - compile to one image per page, with configurable PPI
 - 📝 **Typst syntax** support for beautiful document formatting
 - 🧩 **Rich data support** - pass complex nested data structures
 - 📚 **PDF standard selection** - enforce standards like `a-3a`, `ua-1`, and `1.7`
@@ -134,6 +135,36 @@ config = Imprintor.Config.new(template, %{}, pdf_standard: "a-3a")
 
 Supported values are:
 `1.4`, `1.5`, `1.6`, `1.7`, `2.0`, `a-1a`, `a-1b`, `a-2a`, `a-2b`, `a-2u`, `a-3a`, `a-3b`, `a-3u`, `a-4`, `a-4e`, `a-4f`, `ua-1`.
+
+### PNG Generation
+
+`Imprintor.compile_to_png/1` renders a template to one PNG binary per page,
+returned as a list in page order:
+
+```elixir
+template = "= Hello #elixir_data.name!"
+config = Imprintor.Config.new(template, %{"name" => "World"})
+
+{:ok, [png_binary]} = Imprintor.compile_to_png(config)
+File.write!("output.png", png_binary)
+```
+
+Pass `:ppi` to control the rendered resolution (defaults to `144.0`, matching
+`typst-cli`):
+
+```elixir
+config = Imprintor.Config.new(template, %{"name" => "World"}, ppi: 288.0)
+{:ok, [png_binary]} = Imprintor.compile_to_png(config)
+```
+
+`Imprintor.compile_to_png_file/2` writes the image(s) straight to disk. A
+single-page document is written to the given path as-is; a multi-page
+document gets the 1-based page number inserted before the extension:
+
+```elixir
+{:ok, ["report-1.png", "report-2.png"]} =
+  Imprintor.compile_to_png_file(config, "report.png")
+```
 
 ### Tagged Bytes for `pdf.attach`
 

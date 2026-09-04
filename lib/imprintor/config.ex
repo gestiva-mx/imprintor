@@ -13,6 +13,7 @@ defmodule Imprintor.Config do
   * `:root_directory` - The root directory for resolving relative paths (defaults to ".")
   * `:data` - A map containing template data and variables for document generation
   * `:pdf_standard` - Optional PDF standard string (e.g. `"a-3a"`, `"ua-1"`, `"1.7"`)
+  * `:ppi` - Optional pixels-per-inch used for PNG rendering (defaults to `144.0`)
 
   ## Examples
 
@@ -32,7 +33,7 @@ defmodule Imprintor.Config do
       ])
   """
 
-  defstruct [:source_document, :extra_fonts, :root_directory, :data, :pdf_standard]
+  defstruct [:source_document, :extra_fonts, :root_directory, :data, :pdf_standard, :ppi]
 
   @doc """
   Creates a new configuration struct.
@@ -48,6 +49,7 @@ defmodule Imprintor.Config do
   * `:extra_fonts` - List of additional font files to include (defaults to `[]`)
   * `:root_directory` - Root directory for resolving relative paths (defaults to `"."`)
   * `:pdf_standard` - PDF standard to enforce (defaults to `nil` / Typst default)
+  * `:ppi` - Pixels-per-inch for PNG rendering (defaults to `nil`, which uses `144.0`)
 
   ## Returns
 
@@ -83,12 +85,15 @@ defmodule Imprintor.Config do
 
     pdf_standard = Keyword.get(opts, :pdf_standard)
 
+    ppi = Keyword.get(opts, :ppi)
+
     %__MODULE__{
       source_document: source_document,
       extra_fonts: extra_fonts,
       root_directory: root_directory,
       data: data,
-      pdf_standard: pdf_standard
+      pdf_standard: pdf_standard,
+      ppi: ppi
     }
   end
 end
