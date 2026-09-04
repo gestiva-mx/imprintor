@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use typst::diag::{FileError, FileResult, PackageError, PackageResult};
 use typst::ecow::eco_format;
 use typst::foundations::{Array, Dict, Str, Value};
-use typst::foundations::{Bytes, Datetime};
+use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::package::PackageSpec;
-use typst::syntax::{FileId, Source};
+use typst::syntax::{FileId, Source, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt};
-use typst_kit::fonts::{FontSlot, Fonts};
+use typst_kit::fonts::{self, FontStore};
 use typst_pdf::{PdfOptions, PdfStandard, PdfStandards};
 /// A File that will be stored in the HashMap.
 #[derive(Clone, Debug)]
@@ -47,13 +47,11 @@ impl FileEntry {
     }
 }
 
-#[derive(Debug)]
 struct ImprintorNifWorld {
     root: PathBuf,
     source: Source,
     library: LazyHash<Library>,
-    book: LazyHash<FontBook>,
-    fonts: Vec<FontSlot>,
+    fonts: FontStore,
     files: Arc<Mutex<HashMap<FileId, FileEntry>>>,
     time: time::OffsetDateTime,
     cache_directory: PathBuf,
@@ -72,12 +70,14 @@ impl ImprintorNifWorld {
     fn new(config: ImprintorConfig) -> Self {
         let root = PathBuf::from(config.root_directory);
 
-        let font_searcher = match config.extra_fonts {
-            Some(fonts) => Fonts::searcher()
-                .include_system_fonts(true)
-                .search_with(fonts),
-            None => Fonts::searcher().include_system_fonts(true).search(),
-        };
+        let mut font_store = FontStore::new();
+        font_store.extend(fonts::system());
+        font_store.extend(fonts::embedded());
+        if let Some(extra_fonts) = config.extra_fonts {
+            for path in &extra_fonts {
+                font_store.extend(fonts::scan(std::path::Path::new(path)));
+            }
+        }
 
         let mut dict = Dict::new();
 
@@ -95,9 +95,8 @@ impl ImprintorNifWorld {
 
         Self {
             source: Source::detached(config.source_document),
-            fonts: font_searcher.fonts,
+            fonts: font_store,
             time: time::OffsetDateTime::now_utc(),
-            book: LazyHash::new(font_searcher.book),
             library: LazyHash::new(library),
             files: Arc::new(Mutex::new(HashMap::new())),
             root,
@@ -113,15 +112,18 @@ impl ImprintorNifWorld {
         if let Some(entry) = files.get(&id) {
             return Ok(entry.clone());
         }
-        let path = if let Some(package) = id.package() {
-            // Fetching file from package
-            let package_dir = self.download_package(package)?;
-            id.vpath().resolve(&package_dir)
-        } else {
-            // Fetching file from disk
-            id.vpath().resolve(&self.root)
+        let path = match id.root() {
+            VirtualRoot::Package(package) => {
+                // Fetching file from package
+                let package_dir = self.download_package(package)?;
+                id.vpath().realize(&package_dir)
+            }
+            VirtualRoot::Project => {
+                // Fetching file from disk
+                id.vpath().realize(&self.root)
+            }
         }
-        .ok_or(FileError::AccessDenied)?;
+        .map_err(|_| FileError::AccessDenied)?;
 
         let content = std::fs::read(&path).map_err(|error| FileError::from_io(error, &path))?;
         Ok(files
@@ -262,7 +264,7 @@ impl typst::World for ImprintorNifWorld {
 
     /// Metadata about all known Books.
     fn book(&self) -> &LazyHash<FontBook> {
-        &self.book
+        self.fonts.book()
     }
 
     /// Accessing the main source file.
@@ -286,14 +288,14 @@ impl typst::World for ImprintorNifWorld {
 
     /// Accessing a specified font per index of font book.
     fn font(&self, id: usize) -> Option<Font> {
-        self.fonts[id].get()
+        self.fonts.font(id)
     }
 
     /// Get the current date.
     ///
     /// Optionally, an offset in hours is given.
-    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
-        let offset = offset.unwrap_or(0);
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+        let offset = offset.map(|offset| offset.hours() as i64).unwrap_or(0);
         let offset = time::UtcOffset::from_hms(offset.try_into().ok()?, 0, 0).ok()?;
         let time = self.time.checked_to_offset(offset)?;
         Some(Datetime::Date(time.date()))
@@ -350,7 +352,7 @@ fn typst_to_pdf_file<'a>(config: ImprintorConfig, output_path: String) -> Result
     }
 }
 
-fn build_pdf_options(pdf_standard: Option<&str>) -> Result<PdfOptions<'static>, String> {
+fn build_pdf_options(pdf_standard: Option<&str>) -> Result<PdfOptions, String> {
     let mut options = PdfOptions::default();
 
     if let Some(standard_value) = pdf_standard {
@@ -362,8 +364,8 @@ fn build_pdf_options(pdf_standard: Option<&str>) -> Result<PdfOptions<'static>, 
             )
         })?;
 
-        options.standards =
-            PdfStandards::new(&[standard]).map_err(|err| format!("Invalid PDF standard: {err}"))?;
+        options.standards = PdfStandards::new(&[standard])
+            .map_err(|err| format!("Invalid PDF standard: {err:?}"))?;
     }
 
     Ok(options)
@@ -394,6 +396,25 @@ fn parse_pdf_standard(input: &str) -> Option<PdfStandard> {
         "a-4f" => Some(PdfStandard::A_4f),
         "ua-1" => Some(PdfStandard::Ua_1),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `build_pdf_options` only ever calls `PdfStandards::new` with a single
+    /// standard, so it can never hit the conflicting-standards error branch.
+    /// This exercises that branch directly against the underlying crate to
+    /// confirm `PdfStandards::new`'s error type is still `Debug`-formattable
+    /// (the `{err:?}` in `build_pdf_options` relies on this after typst-pdf
+    /// 0.15 dropped `Display` from `HintedString`).
+    #[test]
+    fn conflicting_pdf_standards_error_is_debug_formattable() {
+        let result = PdfStandards::new(&[PdfStandard::V_1_4, PdfStandard::V_1_7]);
+        let err = result.expect_err("conflicting PDF version standards should fail to construct");
+        let message = format!("Invalid PDF standard: {err:?}");
+        assert!(!message.is_empty());
     }
 }
 

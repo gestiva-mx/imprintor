@@ -9,14 +9,15 @@
   crate-type = ["cdylib"]
 
 [dependencies]
-  rustler = { version = "0.37.2", default-features = false, features = [
+  rustler = { version = "0.38.0", default-features = false, features = [
     "derive",
   ] }
-  typst = "0.14.2"
-  typst-kit = { version = "0.14.2", default-features = false, features = [
-    "embed-fonts",
+  typst = "0.15.1"
+  typst-kit = { version = "0.15.1", default-features = false, features = [
+    "embedded-fonts",
+    "scan-fonts",
   ] }
-  typst-pdf = "0.14.2"
+  typst-pdf = "0.15.1"
   time = "0.3.44"
   serde_json = "1.0.145"
   ureq = "3.1.4"

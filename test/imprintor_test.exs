@@ -365,6 +365,31 @@ defmodule ImprintorTest do
     end
   end
 
+  test "compile_to_pdf with datetime.today offset" do
+    template = """
+    #set document(date: datetime.today(offset: 5))
+
+    = Offset Date Test
+
+    *Positive offset:* #datetime.today(offset: 5).display()
+    *Negative offset:* #datetime.today(offset: -5).display()
+    """
+
+    config = Imprintor.Config.new(template)
+
+    case Imprintor.compile_to_pdf(config) do
+      {:ok, pdf_binary} ->
+        assert is_binary(pdf_binary)
+        assert byte_size(pdf_binary) > 0
+        assert String.starts_with?(pdf_binary, "%PDF")
+
+      {:error, reason} ->
+        flunk(
+          "Expected successful PDF generation with datetime offset, got error: #{inspect(reason)}"
+        )
+    end
+  end
+
   test "compile_to_pdf supports tagged bytes tuple for pdf.attach" do
     template = """
     #set document(date: datetime.today())
