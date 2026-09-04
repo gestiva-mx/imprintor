@@ -376,8 +376,13 @@ fn typst_to_png_file(config: ImprintorConfig, output_path: String) -> Result<Vec
 
     let output_paths = page_output_paths(&output_path, pages.len());
 
-    for (path, png_bytes) in output_paths.iter().zip(pages) {
-        std::fs::write(path, png_bytes).map_err(|err| err.to_string())?;
+    for (index, (path, png_bytes)) in output_paths.iter().zip(pages).enumerate() {
+        if let Err(err) = std::fs::write(path, png_bytes) {
+            for written_path in &output_paths[..index] {
+                let _ = std::fs::remove_file(written_path);
+            }
+            return Err(err.to_string());
+        }
     }
 
     Ok(output_paths)
