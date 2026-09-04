@@ -18,6 +18,8 @@
     "scan-fonts",
   ] }
   typst-pdf = "0.15.1"
+  typst-layout = "0.15.1"
+  typst-render = "0.15.1"
   time = "0.3.44"
   serde_json = "1.0.145"
   ureq = "3.1.4"

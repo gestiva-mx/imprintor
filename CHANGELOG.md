@@ -1,5 +1,10 @@
 ## Changelog
 
+## Unreleased
+
+- **Added:** `Imprintor.compile_to_png/1` and `Imprintor.compile_to_png_file/2` — render a Typst template to PNG image(s) instead of a PDF ([#16](https://github.com/mfeckie/imprintor/issues/16)). Multi-page documents produce one binary/file per page; `Imprintor.Config` gains an optional `:ppi` field (defaults to `144.0`, matching `typst-cli`).
+- Bumps typst/typst-kit/typst-pdf to 0.15.1 and rustler to 0.38.0.
+
 ### 0.1.0
 
 - Initial release

@@ -13,7 +13,9 @@ use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt};
 use typst_kit::fonts::{self, FontStore};
+use typst_layout::PagedDocument;
 use typst_pdf::{PdfOptions, PdfStandard, PdfStandards};
+use typst_render::RenderOptions;
 /// A File that will be stored in the HashMap.
 #[derive(Clone, Debug)]
 struct FileEntry {
@@ -64,6 +66,7 @@ pub struct ImprintorConfig<'a> {
     data: Option<Term<'a>>,
     root_directory: String,
     pdf_standard: Option<String>,
+    ppi: Option<f64>,
 }
 
 impl ImprintorNifWorld {
@@ -302,21 +305,11 @@ impl typst::World for ImprintorNifWorld {
     }
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
-fn typst_to_pdf<'a>(
-    env: rustler::Env<'a>,
-    config: ImprintorConfig,
-) -> Result<rustler::Binary<'a>, String> {
-    let pdf_options = build_pdf_options(config.pdf_standard.as_deref())?;
-    let world = ImprintorNifWorld::new(config);
-
-    match typst::compile(&world).output {
-        Ok(document) => {
-            let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
-            let mut binary = rustler::OwnedBinary::new(pdf_bytes.len()).unwrap();
-            binary.as_mut_slice().copy_from_slice(&pdf_bytes);
-            Ok(binary.release(env))
-        }
+/// Compiles the world's source into a paged document, formatting any
+/// diagnostics into a single error string on failure.
+fn compile_document(world: &ImprintorNifWorld) -> Result<PagedDocument, String> {
+    match typst::compile::<PagedDocument>(world).output {
+        Ok(document) => Ok(document),
         Err(errors) => {
             let error_msg = errors
                 .iter()
@@ -329,27 +322,128 @@ fn typst_to_pdf<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
+fn typst_to_pdf<'a>(
+    env: rustler::Env<'a>,
+    config: ImprintorConfig,
+) -> Result<rustler::Binary<'a>, String> {
+    let pdf_options = build_pdf_options(config.pdf_standard.as_deref())?;
+    let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
+
+    let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
+    let mut binary = rustler::OwnedBinary::new(pdf_bytes.len()).unwrap();
+    binary.as_mut_slice().copy_from_slice(&pdf_bytes);
+    Ok(binary.release(env))
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
 fn typst_to_pdf_file<'a>(config: ImprintorConfig, output_path: String) -> Result<String, String> {
     let pdf_options = build_pdf_options(config.pdf_standard.as_deref())?;
     let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
 
-    match typst::compile(&world).output {
-        Ok(document) => {
-            let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
-            match std::fs::write(&output_path, pdf_bytes) {
-                Ok(_) => Ok(output_path.into()),
-                Err(err) => Err(err.to_string().into()),
-            }
-        }
-        Err(errors) => {
-            let error_msg = errors
-                .iter()
-                .map(|e| format!("{:?}", e))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(format!("Compilation failed: {}", error_msg))
-        }
+    let pdf_bytes = typst_pdf::pdf(&document, &pdf_options).unwrap();
+    std::fs::write(&output_path, pdf_bytes).map_err(|err| err.to_string())?;
+    Ok(output_path)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn typst_to_png<'a>(
+    env: rustler::Env<'a>,
+    config: ImprintorConfig,
+) -> Result<Vec<rustler::Binary<'a>>, String> {
+    let ppi = config.ppi;
+    let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
+    let pages = render_document_to_pngs(&document, ppi)?;
+
+    pages
+        .into_iter()
+        .map(|png_bytes| {
+            let mut binary = rustler::OwnedBinary::new(png_bytes.len()).unwrap();
+            binary.as_mut_slice().copy_from_slice(&png_bytes);
+            Ok(binary.release(env))
+        })
+        .collect()
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn typst_to_png_file(config: ImprintorConfig, output_path: String) -> Result<Vec<String>, String> {
+    let ppi = config.ppi;
+    let world = ImprintorNifWorld::new(config);
+    let document = compile_document(&world)?;
+    let pages = render_document_to_pngs(&document, ppi)?;
+
+    let output_paths = page_output_paths(&output_path, pages.len());
+
+    for (path, png_bytes) in output_paths.iter().zip(pages) {
+        std::fs::write(path, png_bytes).map_err(|err| err.to_string())?;
     }
+
+    Ok(output_paths)
+}
+
+/// Renders every page of a document to PNG bytes at the given pixel density.
+///
+/// `ppi` defaults to 144 (matching `typst-cli`'s default) when not given.
+fn render_document_to_pngs(
+    document: &PagedDocument,
+    ppi: Option<f64>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let options = build_render_options(ppi);
+
+    document
+        .pages()
+        .iter()
+        .map(|page| {
+            typst_render::render(page, &options)
+                .encode_png()
+                .map_err(|err| format!("Failed to encode PNG: {err}"))
+        })
+        .collect()
+}
+
+fn build_render_options(ppi: Option<f64>) -> RenderOptions {
+    let ppi = ppi.unwrap_or(144.0);
+
+    RenderOptions {
+        pixel_per_pt: typst::utils::Scalar::new(ppi / 72.0),
+        render_bleed: false,
+    }
+}
+
+/// Derives one output path per page. A single-page document is written
+/// directly to `output_path`; multi-page documents get the 1-based page
+/// number inserted before the file extension (e.g. `out.png` -> `out-1.png`,
+/// `out-2.png`, ...).
+fn page_output_paths(output_path: &str, page_count: usize) -> Vec<String> {
+    if page_count <= 1 {
+        return vec![output_path.to_string()];
+    }
+
+    let path = std::path::Path::new(output_path);
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(output_path);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+
+    (1..=page_count)
+        .map(|page_number| {
+            let file_name = match extension {
+                Some(extension) => format!("{stem}-{page_number}.{extension}"),
+                None => format!("{stem}-{page_number}"),
+            };
+
+            match parent {
+                Some(parent) => parent.join(file_name).to_string_lossy().into_owned(),
+                None => file_name,
+            }
+        })
+        .collect()
 }
 
 fn build_pdf_options(pdf_standard: Option<&str>) -> Result<PdfOptions, String> {

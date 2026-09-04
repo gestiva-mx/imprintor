@@ -564,6 +564,73 @@ defmodule ImprintorTest do
     end
   end
 
+  test "compile_to_png with simple template" do
+    template = "= Hello PNG\n\nThis is a test document rendered to PNG."
+    config = Imprintor.Config.new(template)
+
+    case Imprintor.compile_to_png(config) do
+      {:ok, [png_binary]} ->
+        assert is_binary(png_binary)
+        assert byte_size(png_binary) > 0
+        # PNG files start with this fixed 8-byte signature
+        assert :binary.part(png_binary, 0, 8) == <<137, 80, 78, 71, 13, 10, 26, 10>>
+
+      {:ok, other} ->
+        flunk("Expected a single-page PNG result, got: #{inspect(other)}")
+
+      {:error, reason} ->
+        flunk("Expected successful PNG generation, got error: #{inspect(reason)}")
+    end
+  end
+
+  test "compile_to_png respects the ppi option" do
+    template = "= PPI Test\n\nThis document is rendered at a custom resolution."
+
+    low_res_config = Imprintor.Config.new(template, %{}, ppi: 72.0)
+    high_res_config = Imprintor.Config.new(template, %{}, ppi: 288.0)
+
+    with {:ok, [low_res_png]} <- Imprintor.compile_to_png(low_res_config),
+         {:ok, [high_res_png]} <- Imprintor.compile_to_png(high_res_config) do
+      # Doubling the ppi twice (72 -> 288 is a 4x increase) should produce a
+      # meaningfully larger raster image.
+      assert byte_size(high_res_png) > byte_size(low_res_png)
+    else
+      {:error, reason} ->
+        flunk("Expected successful PNG generation, got error: #{inspect(reason)}")
+    end
+  end
+
+  test "compile_to_png with multiple pages returns one binary per page" do
+    template = """
+    = Page One
+
+    #pagebreak()
+
+    = Page Two
+
+    #pagebreak()
+
+    = Page Three
+    """
+
+    config = Imprintor.Config.new(template)
+
+    case Imprintor.compile_to_png(config) do
+      {:ok, pages} when length(pages) == 3 ->
+        for png_binary <- pages do
+          assert is_binary(png_binary)
+          assert byte_size(png_binary) > 0
+          assert :binary.part(png_binary, 0, 8) == <<137, 80, 78, 71, 13, 10, 26, 10>>
+        end
+
+      {:ok, other} ->
+        flunk("Expected three PNG pages, got: #{inspect(length(other))} page(s)")
+
+      {:error, reason} ->
+        flunk("Expected successful PNG generation, got error: #{inspect(reason)}")
+    end
+  end
+
   describe "Direct to file" do
     setup do
       on_exit(fn ->
@@ -621,6 +688,76 @@ defmodule ImprintorTest do
 
       case Imprintor.compile_to_pdf_file(config, invalid_path) do
         {:ok, _path} ->
+          flunk("Expected error due to invalid file path, but got success.")
+
+        {:error, _reason} ->
+          assert true
+
+        error ->
+          flunk("Expected error tuple due to invalid file path, got: #{inspect(error)}")
+      end
+    end
+
+    test "compile_to_png_file writes a single PNG to the specified file" do
+      on_exit(fn -> File.rm("test_output.png") end)
+
+      template = "= Hello PNG File Output\n\nThis document is written directly to a file."
+      config = Imprintor.Config.new(template)
+
+      case Imprintor.compile_to_png_file(config, "test_output.png") do
+        {:ok, ["test_output.png"]} ->
+          assert File.exists?("test_output.png")
+          {:ok, png_binary} = File.read("test_output.png")
+          assert is_binary(png_binary)
+          assert byte_size(png_binary) > 0
+          assert :binary.part(png_binary, 0, 8) == <<137, 80, 78, 71, 13, 10, 26, 10>>
+
+        {:error, reason} ->
+          flunk("Expected successful PNG file generation, got error: #{inspect(reason)}")
+      end
+    end
+
+    test "compile_to_png_file writes one PNG per page for multi-page documents" do
+      on_exit(fn ->
+        File.rm("test_output-1.png")
+        File.rm("test_output-2.png")
+      end)
+
+      template = """
+      = Page One
+
+      #pagebreak()
+
+      = Page Two
+      """
+
+      config = Imprintor.Config.new(template)
+
+      case Imprintor.compile_to_png_file(config, "test_output.png") do
+        {:ok, ["test_output-1.png", "test_output-2.png"] = paths} ->
+          for path <- paths do
+            assert File.exists?(path)
+            {:ok, png_binary} = File.read(path)
+            assert byte_size(png_binary) > 0
+            assert :binary.part(png_binary, 0, 8) == <<137, 80, 78, 71, 13, 10, 26, 10>>
+          end
+
+        {:ok, other} ->
+          flunk("Expected two page-numbered PNG paths, got: #{inspect(other)}")
+
+        {:error, reason} ->
+          flunk("Expected successful PNG file generation, got error: #{inspect(reason)}")
+      end
+    end
+
+    test "compile_to_png_file with invalid path returns error" do
+      template = "= Invalid Path Test\n\nThis document tests invalid file path handling."
+      config = Imprintor.Config.new(template)
+
+      invalid_path = "/invalid_path/test_output.png"
+
+      case Imprintor.compile_to_png_file(config, invalid_path) do
+        {:ok, _paths} ->
           flunk("Expected error due to invalid file path, but got success.")
 
         {:error, _reason} ->
